@@ -1,0 +1,21 @@
+{
+  "bedrooms": 4,
+  "bathrooms": 2.5,
+  "sqft_living": 2400,
+  "sqft_lot": 7500,
+  "floors": 2,
+  "waterfront": 0,
+  "view": 1,
+  "condition": 4,
+  "grade": 8,
+  "sqft_above": 2000,
+  "sqft_basement": 400,
+  "yr_built": 2005,
+  "yr_renovated": 0,
+  "zipcode": "98052",
+  "lat": 47.67,
+  "long": -122.12,
+  "distance_to_city_km": 12.5,
+  "school_rating": 8,
+  "crime_index": 25
+}
