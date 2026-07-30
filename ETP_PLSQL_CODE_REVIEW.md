@@ -5,6 +5,7 @@ Reviewed files:
 - `STEP_2_ETPL_PY24_FINAL_FILE_Update.txt`
 - `STEP_3a_Append_BIG3_Data.txt`
 - `STEP_3b_Append_NONSCB_Data.txt`
+- `STEP_4_WIPS_ERROR_FIXES.txt`
 - `ETP_SelfCheck__Website.xlsx` (used as the validation spec these scripts must satisfy)
 
 The self-check workbook's `3a. ETP Self-Check Results` tab confirms the rules this pipeline needs to
@@ -176,6 +177,163 @@ included. Consider a symmetric `BETWEEN` with an explicit PY start date.
   `provider_service_id` alone, and simplifying by joining directly to `ETP_SUNY_ROLLUP_0729` in the
   `USING` clause instead of round-tripping through `etp_annual_py24_merge` twice.
 
+## STEP_4 (`STEP_4_WIPS_ERROR_FIXES.txt`) — WIPS Edit-Check Cleanup
+
+This file runs after `STEP_2`/`3a`/`3b`, right before the final extract goes to the 9171
+Self-Checker / WIPS. It's structured as three passes (valid values, duplicates, logical
+relationships), and the review below follows that order.
+
+### Critical
+
+**14. Lines 123–428 — blanket `SET <col> = 0 WHERE <col> IS NULL` across ~35 WIOA/outcome/demographic fields (A125, A127–A171) silently converts "data not reported" into "confirmed zero."**
+This is the single biggest data-integrity concern in the pipeline. A `NULL` in a WIOA
+characteristic field (e.g. a barrier-to-employment flag, A143–A169) or an outcome field (e.g.
+A139/A141, WIOA employment count/earnings) means "we don't know" — zero-filling it asserts "we
+checked, and the answer is no / $0." That's a materially different (and often false) claim in a
+federal performance report, and it has knock-on effects:
+- It does make the self-check's "Missing Info" flags disappear — but for the wrong reason (the
+  data isn't actually present, it's just no longer `NULL`), not because the underlying reporting
+  gap was closed.
+- For earnings fields specifically (A141, A142), a forced `0` is exactly the value the self-check's
+  own "Earnings Not Available" / "Median Earnings" checks are designed to catch — this guarantees
+  that flag will fire for every program where WIOA earnings data was genuinely just missing rather
+  than actually zero.
+- It's also what manufactures Finding 15 below (a fabricated `$1` earnings entry), because a later
+  block in this same file assumes any `A125 = 0` alongside `A123 > 0` needs "fixing," without
+  distinguishing a real reported `$0` from a `NULL` that this file itself zeroed out a few hundred
+  lines earlier.
+
+If WIPS' file format genuinely can't accept a null in a positional field, that's a real constraint
+— but even so, this should likely be scoped to fields where `0` is a defensible default (raw
+counts) and not blanket-applied to earnings and rate-adjacent fields, and ideally logged/flagged so
+someone can distinguish "we know it's zero" from "we don't have this data" for audit purposes.
+
+**15. Lines 558–566 — `A125` (median earnings) gets set to a literal `1` to satisfy "if employed, earnings must be > 0."**
+```sql
+UPDATE ETP_ANNUAL_PY24_ALL_UPDATE_FINAL_FILE a
+SET a.A125 = 1
+WHERE a.A123 > 0
+AND a.A125 = 0;
+```
+`$1` median earnings is not a plausible value for anyone — this passes the ">0" edit check while
+submitting fabricated data to DOL. Trace back why `A125` is `0` here in the first place: this same
+file's own line 123–127 (`SET A125 = 0 WHERE A125 IS NULL`, Finding 14) runs earlier and is the
+most likely source of these zeros. The real fix is to not zero-fill `A125` for rows where `A123 >
+0` in the first place (or to actually source the missing earnings value), not to paper over the
+resulting inconsistency with a dollar amount that means nothing.
+
+### High
+
+**16. Lines 19–29 — the `A102` "collapse repeated periods" fix only fires when the repeated dots are at the very end of the string.**
+```sql
+UPDATE ETP_ANNUAL_PY24_ALL_UPDATE_FINAL_FILE a
+   SET a.A102 = REPLACE(a.A102,'....','.')
+ WHERE SUBSTR(a.A102, -4) LIKE '%....';
+```
+`SUBSTR(a.A102, -4)` only looks at the last 4 characters, so `"...."` occurring mid-string (e.g.
+`"Level II.... Advanced Certificate"`) never satisfies the `WHERE` and is left uncleaned, even
+though the `REPLACE` itself (once triggered) would fix the whole string. `STEP_2`'s equivalent fix
+for `A106` (`REPLACE(F.A106,'..','.')`) has no such positional restriction — worth aligning `A102`
+to the same unconditional approach, since a mid-string run of periods is exactly as likely to be a
+WIPS parsing problem as a trailing one. Also note: a 5+ character run of dots at the end won't fully
+collapse to a single `.` in one pass of this 3-statement ladder (see review notes on why `REPLACE`'s
+non-overlapping matching can leave a residual `..`) — worth testing against real 3+ dot data before
+relying on it.
+
+**17. Lines 534–555 — the `A123`/`A129` and `A124`/`A130` "numerator ≤ denominator" fixes don't implement the rule stated in their own comments, and are inconsistent with the very next block.**
+```sql
+--A) IF A129 > 0, then A123 <= A129
+UPDATE ... SET a.A129 = a.A123
+WHERE a.A129 = 0
+AND a.A123 > 0;
+```
+The comment describes "numerator exceeds a positive denominator"; the code instead only handles
+"denominator is exactly zero." A row where `A129 > 0` but `A123 > A129` (the case the comment
+actually describes) is never touched by either statement and would still trip the self-check's
+"RATE Too High or Low" check on submission. The very next block, for `A126`/`A130`, gets this
+right with a strictly simpler condition:
+```sql
+UPDATE ... SET a.A130 = a.A126
+WHERE a.A126 > A130;
+```
+`a.A126 > A130` correctly covers both the "denominator is zero" and "numerator exceeds a positive
+denominator" cases in one clause. Recommend rewriting the two blocks above it the same way:
+`WHERE a.A123 > a.A129` and `WHERE a.A124 > a.A130`. (Also note line 585's bare `A130` — every
+other line in the file qualifies columns with the `a.` alias; it happens to resolve correctly here
+since there's only one table in scope, but it's an inconsistency worth cleaning up.)
+
+**18. Lines 64–74 — the `A105` backfill's `EXISTS` guard checks the table against itself, not against `OSOS.PROVIDER_SERVICE`.**
+```sql
+UPDATE ETP_ANNUAL_PY24_ALL_UPDATE_FINAL_FILE a
+SET a.A105 = (SELECT SUBSTR(PROVIDER_SERVICE_NAME_UPR,0,250) FROM OSOS.PROVIDER_SERVICE PS
+              WHERE a.PROVIDER_SERVICE_ID = PS.PROVIDER_SERVICE_ID)
+WHERE EXISTS (SELECT b.PROVIDER_SERVICE_ID FROM ETP_ANNUAL_PY24_ALL_UPDATE_FINAL_FILE b
+              WHERE a.PROVIDER_SERVICE_ID = b.PROVIDER_SERVICE_ID)
+AND a.A105 IS NULL;
+```
+The `EXISTS` subquery joins `a` back to `b`, both aliases of the same
+`ETP_ANNUAL_PY24_ALL_UPDATE_FINAL_FILE` table — every row trivially finds itself, so this condition
+is always true whenever `PROVIDER_SERVICE_ID` is non-null and does nothing. It looks like it was
+meant to guard against the scalar subquery finding no match in `OSOS.PROVIDER_SERVICE` (i.e.
+`WHERE EXISTS (SELECT 1 FROM OSOS.PROVIDER_SERVICE PS WHERE a.PROVIDER_SERVICE_ID =
+PS.PROVIDER_SERVICE_ID)`). Currently harmless (the scalar subquery just returns `NULL` on no match,
+which is a no-op since `A105` was already `NULL`), but it's dead logic that could mislead a future
+reader into thinking there's a check here that isn't actually happening.
+
+**19. The duplicate-removal block (lines 437–495) is a hand-curated list of one-off `DELETE`s from a past submission cycle, not a general dedup query.**
+Every statement hardcodes a specific `PROVIDER_SERVICE_ID` plus a specific field value (an exit
+date in `A172`, an earnings value in `A125`, a `PROVIDER_ID`) apparently copied from a prior WIPS
+rejection report. Since `STEP_2`'s merge only matches on `PROVIDER_SERVICE_ID`, duplicate rows for
+the same program shouldn't be possible to begin with — worth tracing why they occur upstream (most
+likely in the base `OSOS.ETPL_ANN_RPT_9171_ALL_FINAL_2025` extract or in how `STEP_3a`/`3b` insert
+new rows) and fixing there. As written, this section:
+- won't catch next cycle's duplicates (different IDs), so it has to be manually rewritten every
+  submission,
+- could silently do nothing if the underlying row's values have since changed, or
+- could delete the wrong row on a future run if some other program coincidentally matches the same
+  literal `PROVIDER_SERVICE_ID` + value combination.
+
+A generic `ROW_NUMBER() OVER (PARTITION BY <true duplicate key> ORDER BY <tiebreak>)` deleting
+`WHERE rn > 1` would be reusable across cycles and would actually match the section's own stated
+intent ("if a set of fields have the same data... keep 1, delete others") instead of independently
+reasoned single-row deletes.
+
+### Medium
+
+**20. Lines 40–42 and 91–93 — missing `A102`/`A106` descriptions get replaced with one canned sentence for every program, regardless of what the program actually is.**
+```sql
+SET a.A102 = 'Adult Continuing Education.' WHERE a.A102 IS NULL;
+...
+SET a.A106 = 'Adult educational program or course providing knowledge enhancement with the goal of suitable employment.' WHERE a.A106 IS NULL;
+```
+This clears the "not null" edit check but injects identical generic boilerplate across
+unrelated programs (a welding certificate and a nursing program would get the same description if
+both were missing one). Reasonable as a last-resort default to avoid a hard reject, but worth a
+comment flagging it as a placeholder and, ideally, periodically checking how many rows actually
+rely on it — a high count would indicate a real upstream data-collection gap rather than a rare
+edge case.
+
+**21. Carriage-return/line-feed stripping (lines 44–50) is only applied to `A102`, not to `A105`/`A106`/`A103`, which are equally free text.**
+An embedded `CHR(13)`/`CHR(10)` in a program title (`A105`) or description (`A106`) would corrupt
+the flat file's record structure the same way it would in `A102`. Worth applying the same strip to
+every free-text field, not just the one where it happened to be observed.
+
+**22. The `A121`/`A122` fix (lines 522–531) and the `A126`/`A130` fix (lines 578–586) resolve a numerator/denominator (or subset/superset) mismatch by inflating the smaller field up to match the larger one, without knowing which side is actually wrong.**
+`A122` (completers) should be a subset of `A121` (all exiters); when `A122 > A121`, this file raises
+`A121` to close the gap rather than investigating whether `A122` was over-counted instead. Given
+`STEP_1` was already found to compute `A121` and `A122` identically for some sources (prior review,
+Finding 4) and `STEP_3a`/`3b` only ever update some of these fields together (prior review, Finding
+7), the more likely root cause is that the multi-source merge pipeline updates paired
+numerator/denominator or subset/superset fields asymmetrically — this file's fixes mask that
+symptom rather than addressing it upstream.
+
+### Minor / Housekeeping
+
+- **35 sequential single-column `UPDATE ... WHERE ... IS NULL` statements (lines 123–428), each with its own `COMMIT`.** Same issue as the earlier review's Finding 10, at a larger scale — one `UPDATE` with 35 `SET` clauses would be both cheaper and atomic.
+- **Line 116–120 (`A114`) has no explanatory comment**, unlike the `A113` rule immediately above it which quotes the exact WIPS edit-check text. A future reader has no way to know why `A114 = 0` is invalid without independently finding the DOL edit-check spec.
+- **The final extract (lines 593–671) re-applies `WHERE PS.PROVIDER_SERVICE_DESC LIKE '%ETP%'`.** Since `STEP_3a`/`3b` insert new rows without checking this condition, it's worth confirming all appended BIG3/NONSCB programs' `OSOS.PROVIDER_SERVICE` records actually satisfy it — otherwise this filter could silently drop some of the rows `STEP_3a`/`3b` worked to append, with no warning that it happened.
+- **No automated re-check that the hand-curated duplicate `DELETE`s (Finding 19) actually resolved everything** before the final extract runs — a `GROUP BY PROVIDER_SERVICE_ID HAVING COUNT(*) > 1` check immediately before the final `SELECT` would catch anything missed.
+
 ## What's working well
 
 - The `GREATEST(NVL(x,0), NVL(y,0))` pattern used in `STEP_1`'s merge and both `STEP_3a`/`3b`
@@ -187,3 +345,7 @@ included. Consider a symmetric `BETWEEN` with an explicit PY start date.
 - The three-tier layering (SUNY/CUNY/BOCES individual matches → BIG3 aggregate → non-SCB aggregate)
   is a sensible way to combine heterogeneous data sources of decreasing granularity, and the
   row-count `SELECT COUNT(...)` checks after each step show good manual QA discipline.
+- `STEP_4`'s "LOGICAL ERRORS" section (lines 502–586) quotes the actual WIPS edit-check rule text
+  in a comment above most of the fixes (e.g. A108/A109, A113, A121/A122) — that's exactly the kind
+  of documentation the rest of the pipeline is missing, and it's what made it possible to spot that
+  the A123/A129 and A124/A130 code doesn't actually match its own stated rule (Finding 17).
